@@ -149,6 +149,9 @@ EXAMPLES = r'''
 
 
 import os
+import stat
+import socket
+import subprocess
 
 from ansible.module_utils.basic import AnsibleModule, get_platform
 from ansible.module_utils.ismount import ismount
@@ -587,6 +590,54 @@ def get_linux_mounts(module, mntinfo_file="/proc/self/mountinfo"):
 
     return mounts
 
+def _is_valid_fs_spec(src, fstype):
+    """ Determines if an element is a valid fs_spec as per man (5) fstab. 
+    Namely, this helper function checks if src is a block device, label, UUID, 
+    network mount or a potential loopback device.  Should return True or False"""
+
+    # Check for labels and UUIDs.
+    islabel = src.startswith('LABEL=') or src.startswith('PARTLABEL=')
+    isuuid = src.startswith('UUID=') or src.startswith('PARTUUID=')
+    if islabel or isuuid:
+        return True
+    # Check if a file has a filesystem on it.
+    if os.path.isfile(src):
+        if fstype in ['ext2','ext3','ext4']:
+            p = subprocess.Popen(['dumpe2fs', src], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            return not "Couldn't find valid filesystem superblock." in str(stdout)
+        elif fstype == 'xfs':
+            p = subprocess.Popen(['xfs_db', '-rf', src, '-c', 'version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            return not "is invalid (cannot read first 512 bytes)" in str(stderr)
+    # Validate according to man (5) nfs.
+    if (fstype == 'nfs' or fstype == 'nfs4') and (src.count(':') == 1 or src.startswith('[')):
+        remotepath = src.split(':')[-1]
+        server = ':'.join(src.split(':')[0:-1])
+        # Try IPv6 validation if it looks like IPv6.
+        if server.startswith('[') and server.endswith(']'):
+            try:
+                socket.getaddrinfo(server.strip('[]'), None, socket.AF_INET6)
+                validserver = True
+            except:
+                validserver = False
+        else:
+            try:
+                socket.gethostbyname(server)
+                validserver = True
+            except:
+                validserver = False
+        validremotepath = remotepath.startswith('/')
+        if validserver and validremotepath:
+            return True
+    if fstype == 'cifs' and src.startswith('//'):
+        return True
+    # Check for block device.
+    try:
+        return stat.S_ISBLK(os.stat(src).st_mode)
+    except:
+        return False
+    return False
 
 def main():
     module = AnsibleModule(
@@ -710,8 +761,8 @@ def main():
 
             changed = True
     elif state == 'mounted':
-        if not os.path.exists(args['src']):
-            module.fail_json(msg="Unable to mount %s as it does not exist" % args['src'])
+        if not _is_valid_fs_spec(args['src'], args['fstype']):
+            module.fail_json(msg="Unable to mount %s as it is not a valid fs_spec." % args['src'])
 
         if not os.path.exists(name) and not module.check_mode:
             try:
